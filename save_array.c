@@ -44,4 +44,4 @@ void save_array(double *array, AppCtx *app)
     fprintf(fp, "</VTKFile>\n");
     fclose(fp);
 
-} 
+}

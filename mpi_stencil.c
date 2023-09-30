@@ -1,175 +1,265 @@
-#include <stdlib.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <math.h>
 #include <mpi.h>
+#include <string.h>
+#include <unistd.h>
+#include <ctype.h>
+#include <stdbool.h>
+
 #include "appctx.h"
+
+/* Mostra a ajuda */
+void show_help(char *name)
+{
+  fprintf(stderr, "\
+            [uso] %s <opcoes>\n\
+            -h         mostra essa tela e sai.    \n\
+            -n <int>   tamanho do grid.           \n\
+            -i <int>   numero maximo de iterações \n\
+            -e <int>   energia a ser injetado     .\n",
+          name);
+  exit(-1);
+}
 
 void save_array(double *array, AppCtx *app);
 
-void ZeraVector(double *uold, double *unew, double *f, int ndof) {
-  for (int i = 0; i < ndof; i++) {
+void GetParameters(int argc, char *argv[], AppCtx *app)
+{
+
+  MPI_Comm_rank(MPI_COMM_WORLD, &app->rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &app->size);
+
+  app->global_n = 300;
+  app->niters = 1000;
+  app->energy = 10;
+  app->L = 1.0;
+  char opt;
+  char *optarg = NULL;
+  while ((opt = getopt(argc, argv, "hn:i:e:")) != -1)
+  {
+    switch (opt)
+    {
+    case 'h': /* help */
+      show_help(argv[0]);
+      break;
+    case 'n': /* opção -n */
+      app->global_n = atoi(optarg);
+      break;
+    case 'i': /* opção -i */
+      app->niters = atoi(optarg);
+      break;
+    case 'e': /* opção -e */
+      app->energy = atoi(optarg);
+      break;
+    default:
+      fprintf(stderr, "Opcao invalida ou faltando argumento: `%c'\n", opt);
+      exit(-1);
+    }
+  }
+
+  app->local_n = app->global_n / app->size;
+
+  app->ndof = (app->local_n + 2) * (app->global_n);
+}
+
+void ZeraVector(double *uold, double *unew, double *f, int ndof)
+{
+  for (int i = 0; i < ndof; i++)
+  {
     uold[i] = 0.0;
     unew[i] = 0.0;
     f[i] = 0.0;
   }
 }
 
-#define ind(i, j) ((i) * (n + 2) + (j))
+// define uma macro para acessar os elementos do vetor
 
-int main(int argc, char **argv) {
-  int tag1 = 1, tag2 = 2, tag3 = 3, tag4 = 4;
+#define ind(i, j) (i) * (app.global_n) + (j)
+#define ind_global(i, j) (i) * (app.global_n) + (j)
+
+int main(int argc, char **argv)
+{
+  int tag1 = 1, tag2 = 1, tag3 = 1, tag4 = 1;
+  int cont_com = 0;
   MPI_Init(&argc, &argv);
 
-  int rank, size;
-  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-  MPI_Comm_size(MPI_COMM_WORLD, &size);
-
   AppCtx app;
-  AppInit(&app, argc, argv);
+  GetParameters(argc, argv, &app);
 
-  int n = app.global_n;
-  int energy = app.energy;
-  int niters = app.niters;
-  int ndof = app.ndof;
-  int n_loc = app.local_n;
+  FILE *file;
+  char filename[20];
+  sprintf(filename, "out%0d.txt", app.rank);
+  file = fopen(filename, "w");
 
-  int dims[2] = {0, 0};
-  int periods[2] = {0, 0};
-  MPI_Dims_create(size, 2, dims);
-  MPI_Comm cart_comm;
-  MPI_Cart_create(MPI_COMM_WORLD, 2, dims, periods, 1, &cart_comm);
+  MPI_Request request[4];
+  MPI_Status stats[4];
 
-  int coords[2];
-  MPI_Cart_coords(cart_comm, rank, 2, coords);
-  app.rank = rank;
-  app.size = size;
+  int n = app.global_n;    // número de pontos em cada dimensão
+  int nl = app.local_n;    // número de pontos em cada dimensão que cada processo é responsável
+  int energy = app.energy; // energy to be injected per iteration
+  int niters = app.niters; // number of iterations
 
-  double *uold = (double *)malloc(ndof * sizeof(double));
-  double *unew = (double *)malloc(ndof * sizeof(double));
-  double *f_local = (double *)malloc(ndof * sizeof(double));
+  int ndof = app.ndof; // number of degrees of freedom
+
+  // Para a implementação paralela
+  // Cada processo deve ter uma cópia local de uold e unew com tamanho (app->local_n + 2) * (app->global_n)
+  double *uold = (double *)malloc(ndof * sizeof(double)); //
+  double *unew = (double *)malloc(ndof * sizeof(double)); //
+  double *f = (double *)malloc(ndof * sizeof(double));    //
+
+  int buff_size = app.global_n; // tamanho do buffer usado para armazenar os valores
+
+  double *recv_buff_down = (double *)malloc(buff_size * sizeof(double));
+  double *recv_buff_up = (double *)malloc(buff_size * sizeof(double));
+
+  double *send_buff_down = (double *)malloc(buff_size * sizeof(double));
+  double *send_buff_up = (double *)malloc(buff_size * sizeof(double));
+
   double *tmp;
-  ZeraVector(uold, unew, f_local, ndof);
+
+  double *usave = (double *)malloc((ndof * app.size) * sizeof(double)); // armazena a solução de todos os processos
+
+  // Inicializa os vetores
+  ZeraVector(uold, unew, f, ndof); // inicializa como zero
+                                   //  Termo fonte
+  int s1x = 1 + app.global_n / 4;
+  int s1y = s1x;
+
+  int s2x = 1 + 3 * app.global_n / 4;
+  int s2y = s2x;
   
-  /*///////////////
-    int buff_size = app.local_n + 2;
+  // Cada processo deve determinar quais são os seus vizinhos
+  // e alocar os buffers de envio e recebimento
+  app.coords[0] = 0;        // todos tem a mesma coluna
+  app.coords[1] = app.rank; // calcula a coordenda y  (linha)
+  // Armazena os ranks dos vizinhos abaixo, acima, á esquerda e a direita. O -1 é usado para indicar a ausência de vizinho.
+  app.neighbors[DOWN] = app.rank == app.size - 1 ? -1 : app.rank + 1; // Vizinho abaixo
+  app.neighbors[UP] = app.rank == 0 ? -1 : app.rank - 1;              // Vizinho acima//Nesse cenário, não há necessidade de comunicação horizontal (esquerda/direita), pois todos os processos estão na mesma coluna global.
 
-  double *recv_buff_left = (double*)malloc(buff_size*sizeof(double));
-  double *recv_buff_right = (double*)malloc(buff_size*sizeof(double));
-  double *recv_buff_down = (double*)malloc(buff_size*sizeof(double));
-  double *recv_buff_up = (double*)malloc(buff_size*sizeof(double));
+  // define quais indices da grade global o processo atual é responsável por atualizar
+  int my_globX[2] = {0, n - 1};                                  // Limites das colunas englobadas
+  int my_globY[2] = {app.rank * nl, app.rank * nl + nl - 1}; // Limites das linhas englobadas
 
-  double *send_buff_left = (double*)malloc(buff_size*sizeof(double));
-  double *send_buff_right = (double*)malloc(buff_size*sizeof(double));
-  double *send_buff_down = (double*)malloc(buff_size*sizeof(double));
-  double *send_buff_up = (double*)malloc(buff_size*sizeof(double));
-  ////////////////*/
+  // verifica se os pontos fontes estão dentro do subdominio de responsabilidade do processo atual
 
-  int s1x = 1 + n / 4;
-  int s1y = 1 + n / 4;
+  bool S1_here = s1y >= my_globY[0] && s1y <= my_globY[1];
+  bool S2_here = s2y >= my_globY[0] && s2y <= my_globY[1];
 
-  int s2x = 1 + 3 * n / 4;
-  int s2y = 1 + 3 * n / 4;
-
-  // Determine os pontos de início e fim de cada processo
-  int x_start = coords[0] * n_loc + 1;
-  int x_end = (coords[0] + 1) * n_loc;
-  int y_start = coords[1] * n_loc + 1;
-  int y_end = (coords[1] + 1) * n_loc;
-
-  // Inserir os pontos de calor nos processos corretos
-  if (s1x >= x_start && s1x <= x_end && s1y >= y_start && s1y <= y_end) {
-    f_local[ind(s1x, s1y)] = app.energy;
-  }
-  if (s2x >= x_start && s2x <= x_end && s2y >= y_start && s2y <= y_end) {
-    f_local[ind(s2x, s2y)] = -app.energy;
+  // ajustando os indices globais ao contexto local
+  // subtraindo os limites inferiores dos indices globais
+  if (S1_here)
+  {
+    printf("\nRank: %d - S1_here: %d\n", app.coords[1], S1_here);
+    f[ind(s1x, s1y - my_globY[0])] = app.energy;
   }
 
+  if (S2_here)
+  {
+    printf("\nRank: %d - S2_here: %d\n", app.coords[1], S2_here);
+    f[ind(s2x, s2y - my_globY[0])] = -app.energy;
+  }
 
-  //double t = -AppGetTime();
+  double heat = 0.0; // total heat in system
 
-  double h = app.h;
-  //double h = app.L / ( double ) ( app.global_n + 1 );
+  double t = -MPI_Wtime();
   double sum_error = 0.0;
+
+  double h = app.L / (double)(app.global_n + 1);
   double h2 = h * h;
-  double error = 0.0;
-  double temp=-MPI_Wtime();
 
-  // Obter as coordenadas dos vizinhos
-  int left, right, up, down;
-  MPI_Cart_shift(cart_comm, 0, 1, &up, &down);
-  MPI_Cart_shift(cart_comm, 1, 1, &left, &right);
+  for (int iter = 0; iter < niters; ++iter)
+  {
+    // Definir os buffers de envio valores na borda do subdominio de cada processo que serão enviados ao processos vizinhos
+    for (int i = 0; i < app.global_n; i++)
+    {
+      // Condições para processos que não são nem o primeiro nem o último
+      if (app.rank != 0 && app.rank != app.size - 1)
+      {
+        send_buff_down[i] = uold[n * (nl) + i];
+        send_buff_up[i] = uold[n + i];
+      }
+      // Condições para o primeiro processo
+      else if (app.rank == 0)
+      {
+        send_buff_down[i] = uold[n * (nl) + i];
+        // Para o processo no topo, pode definir o valor de acordo com a condição de contorno ou outra lógica
+        send_buff_up[i] = -1; // ou outro valor conforme a necessidade
+      }
+      // Condições para o último processo
+      else if (app.rank == app.size - 1)
+      {
+        // Para o processo na parte inferior, pode definir o valor de acordo com a condição de contorno ou outra lógica
+        send_buff_down[i] = -1; // ou outro valor conforme a necessidade
+        send_buff_up[i] = uold[n + i];
+      }
+    }
 
-  for (int iter = 0; iter < niters; ++iter) {
-    double local_error = 0.0;
+
+    cont_com = 0;
+    MPI_Barrier(MPI_COMM_WORLD); // sincroniza os processos
+                                 
+    // Cada processo deve trocar as bordas com seus vizinhos
+                                 
+    MPI_Isend(send_buff_down, buff_size, MPI_DOUBLE, app.neighbors[DOWN], tag3, MPI_COMM_WORLD, &request[0]);
+
+    MPI_Isend(send_buff_up, buff_size, MPI_DOUBLE, app.neighbors[UP], tag4, MPI_COMM_WORLD, &request[1]);
+
+    MPI_Recv(recv_buff_down, buff_size, MPI_DOUBLE, app.neighbors[DOWN], tag3, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+    MPI_Recv(recv_buff_up, buff_size, MPI_DOUBLE, app.neighbors[UP], tag4, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    for (int i = 0; i < app.global_n; i++)
+    {
+      if (app.neighbors[DOWN] != -1)
+        uold[n * (nl + 1) + i] = recv_buff_down[i];
+      if (app.neighbors[UP] != -1)
+        uold[i] = recv_buff_up[i];
+    }
     
-    /*/////
-        for(int i=1;i<=app.local_n;i++){
-      send_buff_left[i] = uold[1+(app.local_n+2)*(i)];
-      send_buff_right[i] = uold[(app.local_n)+(app.local_n+2)*(i)];  
-      send_buff_down[i] = uold[(app.local_n + 2) + i];
-      send_buff_up[i] = uold[(app.local_n+2)*app.local_n + i];  
-    }
-    //////////*/
+    double local_error = 0.0;
 
-    // Comunicar as bordas com os vizinhos
-    if(app.neighbors[LEFT]!=-1) MPI_Sendrecv(&uold[ind(1, 0)], n + 2, MPI_DOUBLE, up, tag1,
-                 &uold[ind(n + 1, 0)], n + 2, MPI_DOUBLE, down, tag1, cart_comm, MPI_STATUS_IGNORE);
-    if(app.neighbors[RIGHT]!=-1) MPI_Sendrecv(&uold[ind(n, 0)], n + 2, MPI_DOUBLE, down, tag2,
-                 &uold[ind(0, 0)], n + 2, MPI_DOUBLE, up, tag2, cart_comm, MPI_STATUS_IGNORE);
-    if(app.neighbors[DOWN]!=-1) MPI_Sendrecv(&uold[ind(0, 1)], 1, MPI_DOUBLE, left, tag3,
-                 &uold[ind(0, n + 1)], 1, MPI_DOUBLE, right, tag3, cart_comm, MPI_STATUS_IGNORE);
-    if(app.neighbors[UP]!=-1) MPI_Sendrecv(&uold[ind(0, n)], 1, MPI_DOUBLE, right, tag4,
-                 &uold[ind(0, 0)], 1, MPI_DOUBLE, left, tag4, cart_comm, MPI_STATUS_IGNORE);
-    /*/////
-      for(int i=1;i<=app.local_n;i++){
-      uold[(app.local_n+2)*(i)] = recv_buff_left[i];
-      uold[(app.local_n)+(app.local_n+2)*(i)+1] = recv_buff_right[i];  
-      uold[i] = recv_buff_down[i];
-      uold[(app.local_n+2)*(app.local_n + 1) + i] = recv_buff_up[i];  
-    }
-    /////////*/
-
-    // Cálculo do Stencil
-    for (int i = 1; i <= n; ++i) {
-      for (int j = 1; j <= n; ++j) {
+    // Calculo do Stencil
+    for (int i = 1; i <= app.local_n; i++)
+    {
+      for (int j = 1; j < app.global_n - 1; j++) // Permanece global_n para as colunas
+      {
+        // 2nd order finite difference
         unew[ind(i, j)] = 0.25 * (uold[ind(i - 1, j)] + uold[ind(i + 1, j)] +
                                   uold[ind(i, j - 1)] + uold[ind(i, j + 1)] +
-                                  h2 * f_local[ind(i, j)]);
+                                  h2 * f[ind(i, j)]);
+        // calculo do erro local
         local_error += (unew[ind(i, j)] - uold[ind(i, j)]) * (unew[ind(i, j)] - uold[ind(i, j)]);
       }
     }
 
-   error = sqrt(local_error);
+    MPI_Allreduce(&local_error, &sum_error, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
 
-    
-    MPI_Reduce(&error,&sum_error,1,MPI_DOUBLE,MPI_SUM,0,MPI_COMM_WORLD);
+    sum_error = sqrt(sum_error);
 
-    if (app.rank == 0) printf("rank %d - iter: %d   sum_erro: %8.8e\n", app.rank, iter, sum_error);
+    if (app.rank == 0)
+      printf("rank %d - iter: %d   sum_erro: %8.8e\n", app.rank, iter, sum_error);
 
-    //if (error < app.tol)
-      //break;
+    if (sum_error < 3.5e-6)
+      break;
 
     tmp = unew;
     unew = uold;
-    uold = tmp;
+    uold = tmp; // swap arrays
   }
+  t += MPI_Wtime();
 
-  // Sincronize todos os processos
-  //MPI_Barrier(cart_comm);
+  fclose(file);
 
-  //t += AppGetTime();
+  if (app.rank == 0)
+    printf("last heat: %f  erro: %8.8e  CPU time: %f\n", heat, sum_error, t);
 
-  temp+=MPI_Wtime();
-  save_array(unew, &app);
-  if(app.rank == 0) printf("CPU time: %f\n",temp);
   free(uold);
   free(unew);
-  free(f_local);
-
-  AppFinalize(&app);
-
+  free(recv_buff_down);
+  free(recv_buff_up);
+  free(send_buff_down);
+  free(send_buff_up);
+  free(usave);
   MPI_Finalize();
-
   return 0;
 }
-
